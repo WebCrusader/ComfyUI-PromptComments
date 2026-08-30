@@ -1,0 +1,19 @@
+[project]
+name = "comfyui-promptcomments"
+description = "Prompt text nodes for ComfyUI with commented-out lines: # and // line comments and /* */ blocks render in red and are stripped from the output."
+version = "1.0.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = []
+readme = "README.md"
+keywords = ["comfyui", "comfyui-nodes", "prompt", "text", "comments"]
+
+[project.urls]
+Repository = "https://github.com/WebCrusader/ComfyUI-PromptComments"
+
+[tool.comfy]
+# Fill PublisherId with your ComfyUI Registry publisher handle before running
+# `comfy node publish`. Leaving it blank is fine for a plain GitHub install.
+PublisherId = ""
+DisplayName = "Prompt Comments"
+Icon = ""
