@@ -1,11 +1,14 @@
 import { app } from "../../scripts/app.js";
 
-const VERSION = "v10";
+const VERSION = "v11";
 const TOKEN = "# ";
-const COMMENT_RE = /^(\s*)(#\s?|\/\/\s?)/;
+// Matches only what scan() below would actually treat as a comment: a marker at
+// the start of the line followed by whitespace or nothing. `#hashtag` is text,
+// so the toggle will not "uncomment" it.
+const COMMENT_RE = /^([ \t]*)(?:#|\/\/)(?=[ \t]|$)[ \t]?/;
 const NODE_TYPE = "PromptComments";
 
-console.info(`[prompt_comments] ${VERSION} loaded`);
+console.debug(`[prompt_comments] ${VERSION} loaded`);
 
 const MIRRORED = [
   "fontFamily", "fontSize", "fontWeight", "fontStyle", "fontVariant",
@@ -63,16 +66,41 @@ function injectStyle() {
   document.head.appendChild(el);
 }
 
-/* ---------- comment parsing ---------- */
+/* ---------- comment parsing ----------
+   test_strip_comments.py lifts everything between the two scanner markers below
+   and runs it against the same corpus as the Python filter. Keep the markers in
+   place, and keep this region free of anything that touches the DOM.        */
+
+/* pcm:scanner:begin */
 
 const esc = (s) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+// Stands in for removed comment text. The same character as MARK in
+// nodes.py, and stripped from the input for the same reason: a literal
+// NUL in the prompt would otherwise be indistinguishable from a comment
+// that has already been taken out.
+const MARK = "\u0000";
+
+// The whitespace that can sit either side of a marker. An explicit set, not
+// \s: nodes.py uses the same six characters, and Python's idea of whitespace
+// is wider than JavaScript's. Change one, change both.
+const WS = " \t\r\n\f\v";
+
+// A marker only counts if it starts the text or follows whitespace. This is
+// what keeps `C#`, `#hashtag` and `https://...` out of the scanner.
+const opens = (src, i) => i === 0 || WS.includes(src[i - 1]);
+
+// ...and `#` / `//` also need whitespace or the end of the text after them, so
+// `# note` is a comment and `#note` is a hashtag. `/*` is exempt: it carries
+// its own terminator, so `/*parked` stays usable.
+const closes = (src, i) => i >= src.length || WS.includes(src[i]);
 
 // Single left-to-right pass: the first marker wins, to its natural end.
 // A `#` or `//` runs to the end of its line, a `/*` to the matching `*/` or,
 // unterminated, to the end of the text. Everything downstream - the red
 // painting and the counter - is derived from this one scan, and _mask() in
-// __init__.py mirrors it, so what is painted red is exactly what Python
+// nodes.py mirrors it, so what is painted red is exactly what Python
 // removes. Change one, change both.
 function scan(src) {
   const parts = [];
@@ -85,13 +113,17 @@ function scan(src) {
     }
   };
   while (i < src.length) {
-    if (src.startsWith("/*", i)) {
+    if (src.startsWith("/*", i) && opens(src, i)) {
       flush();
       const end = src.indexOf("*/", i + 2);
       const stop = end === -1 ? src.length : end + 2;
       parts.push({ text: src.slice(i, stop), comment: true });
       i = stop;
-    } else if (src[i] === "#" || src.startsWith("//", i)) {
+    } else if (
+      opens(src, i) &&
+      ((src[i] === "#" && closes(src, i + 1)) ||
+        (src.startsWith("//", i) && closes(src, i + 2)))
+    ) {
       flush();
       let end = src.indexOf("\n", i);
       if (end === -1) end = src.length;
@@ -117,9 +149,10 @@ function highlight(src) {
 }
 
 function liveCount(value) {
+  value = value.split(MARK).join("");
   const total = value.split("\n").filter((l) => l.trim()).length;
   // Comment spans collapse to MARK, line count preserved, exactly as _mask()
-  // does in __init__.py - so a line holding only a comment cannot be counted
+  // does in nodes.py - so a line holding only a comment cannot be counted
   // live, and an unterminated /* takes the rest of the prompt with it.
   let masked = "";
   for (const p of scan(value)) {
@@ -128,13 +161,15 @@ function liveCount(value) {
       continue;
     }
     const breaks = (p.text.match(/\n/g) || []).length;
-    masked += "\u0000" + "\n\u0000".repeat(breaks);
+    masked += MARK + `\n${MARK}`.repeat(breaks);
   }
   const live = masked
     .split("\n")
-    .filter((l) => l.replace(/\u0000/g, "").trim()).length;
+    .filter((l) => l.split(MARK).join("").trim()).length;
   return `${live}/${total}`;
 }
+
+/* pcm:scanner:end */
 
 function activeLines(value, from, to) {
   const start = value.lastIndexOf("\n", from - 1) + 1;
@@ -248,6 +283,7 @@ function probe(widget) {
 const decorated = new WeakSet();
 const registry = [];
 
+
 function decorate(node, widget, ta) {
   if (decorated.has(ta)) return true;
   decorated.add(ta);
@@ -268,7 +304,19 @@ function decorate(node, widget, ta) {
 
   let disposed = false;
   let pending = false;
+  let composing = false;
+  let onScreen = true;
   const observers = [];
+  // Every listener this decoration adds, to the textarea and to window, goes
+  // through this signal so dispose() can drop all of them at once. The frontend
+  // recycles textareas; without this each decoration would leave its handlers
+  // behind, pinning the node and overlay alive and firing alongside the next.
+  const listeners = new AbortController();
+  const signal = listeners.signal;
+  // Declared before dispose() closes over them. A dispose triggered during
+  // setup would otherwise hit the temporal dead zone instead of tearing down.
+  let poll = null;
+  let patchedPosition = null;
 
   // Everything routes through this. Once the node goes away the element tree is
   // torn down, and any observer that keeps reacting would spin forever.
@@ -276,11 +324,12 @@ function decorate(node, widget, ta) {
     if (disposed) return;
     disposed = true;
     for (const o of observers) o.disconnect();
-    clearInterval(poll);
-    window.removeEventListener("resize", onResize);
+    if (poll !== null) clearInterval(poll);
+    listeners.abort();
     hl.remove();
     cnt.remove();
     ta.classList.remove("pcm-live");
+    if (patchedPosition !== null) host.style.position = patchedPosition;
     decorated.delete(ta);
     const i = registry.indexOf(entry);
     if (i > -1) registry.splice(i, 1);
@@ -294,7 +343,11 @@ function decorate(node, widget, ta) {
   const alive = () =>
     !disposed && ta.isConnected && host.isConnected && document.contains(ta);
 
-  if (getComputedStyle(host).position === "static") host.style.position = "relative";
+  // Remember what was there so dispose() hands the host back untouched.
+  if (getComputedStyle(host).position === "static") {
+    patchedPosition = host.style.position;
+    host.style.position = "relative";
+  }
 
   // Circuit breaker: if re-mounting the overlay keeps triggering another
   // removal, stop rather than fight the frontend forever.
@@ -321,6 +374,21 @@ function decorate(node, widget, ta) {
     return true;
   };
 
+  // A textarea takes its scrollbar out of its own content box, so as soon as
+  // the prompt is long enough to scroll its text wraps earlier than the
+  // overlay's would. Matching the padding plus that scrollbar's width keeps the
+  // two wrapping identically - otherwise the red drifts onto the wrong words
+  // while verify() still sees two correctly aligned boxes.
+  let padRight = 0;
+  let borderX = 0;
+  let gutter = -1;
+  const syncGutter = () => {
+    const sb = Math.max(0, ta.offsetWidth - ta.clientWidth - borderX);
+    if (sb === gutter) return;
+    gutter = sb;
+    hl.style.paddingRight = `${padRight + sb}px`;
+  };
+
   const place = () => {
     const r = ta.getBoundingClientRect();
     const hr = host.getBoundingClientRect();
@@ -334,6 +402,12 @@ function decorate(node, widget, ta) {
     for (const p of MIRRORED) hl.style[p] = c[p];
     hl.style.borderColor = "transparent";
 
+    padRight = parseFloat(c.paddingRight) || 0;
+    borderX =
+      (parseFloat(c.borderLeftWidth) || 0) + (parseFloat(c.borderRightWidth) || 0);
+    gutter = -1; // paddingRight was just overwritten by the mirror loop
+    syncGutter();
+
     const left = (r.left - hr.left) / scale;
     const top = (r.top - hr.top) / scale;
     cnt.style.right = `${host.offsetWidth - (left + ta.offsetWidth) + 6}px`;
@@ -346,6 +420,7 @@ function decorate(node, widget, ta) {
     hl.scrollTop = ta.scrollTop;
     hl.scrollLeft = ta.scrollLeft;
     cnt.textContent = liveCount(ta.value);
+    syncGutter(); // a scrollbar can appear on any keystroke
   };
 
   // The textarea's text is hidden only while the overlay is aligned over it and
@@ -354,17 +429,26 @@ function decorate(node, widget, ta) {
   // time, or the red comments show through the white text. Both flip together:
   // aligned -> overlay visible and text transparent; anything else -> the
   // reverse, so the worst case is uncoloured text rather than doubled text.
+  // An IME composition counts as "anything else": the preedit string is drawn
+  // by the textarea and has no counterpart in the overlay, so hiding the
+  // textarea's glyphs would make the user type into nothing.
   const verify = () => {
     const rt = ta.getBoundingClientRect();
     const rh = hl.getBoundingClientRect();
     const ok =
+      !composing &&
       hl.isConnected &&
       hl.offsetWidth > 0 &&
       Math.abs(rt.left - rh.left) < 2 &&
       Math.abs(rt.top - rh.top) < 2 &&
       Math.abs(rt.width - rh.width) < 2;
     entry.live = ok;
-    ta.classList.toggle("pcm-live", ok);
+    // Only write when the value actually changes: the MutationObserver below
+    // watches this very attribute, and a self-inflicted record costs two forced
+    // layouts to discover nothing happened.
+    if (ta.classList.contains("pcm-live") !== ok) {
+      ta.classList.toggle("pcm-live", ok);
+    }
     hl.style.visibility = ok ? "visible" : "hidden";
     return ok;
   };
@@ -398,22 +482,36 @@ function decorate(node, widget, ta) {
     entry.interacted = true;
     refresh();
   };
-  ta.addEventListener("focus", touched);
-  ta.addEventListener("pointerdown", touched);
-  ta.addEventListener("input", () => {
+  const on = (type, fn) => ta.addEventListener(type, fn, { signal });
+
+  on("focus", touched);
+  on("pointerdown", touched);
+  on("input", () => {
     if (!alive()) return dispose();
     entry.interacted = true;
     paint();
     verify();
   });
-  ta.addEventListener("pcm-repaint", () => {
+  on("pcm-repaint", () => {
     if (!alive()) return dispose();
     paint();
     verify();
   });
-  ta.addEventListener("scroll", () => {
+  on("scroll", () => {
     hl.scrollTop = ta.scrollTop;
     hl.scrollLeft = ta.scrollLeft;
+  });
+  // Hand the glyphs back for the duration of a composition, otherwise the
+  // candidate string is typed into transparent text.
+  on("compositionstart", () => {
+    composing = true;
+    verify();
+  });
+  on("compositionend", () => {
+    composing = false;
+    if (!alive()) return dispose();
+    paint();
+    verify();
   });
 
   const ro = new ResizeObserver(schedule);
@@ -435,16 +533,26 @@ function decorate(node, widget, ta) {
   hostMo.observe(host, { childList: true });
   observers.push(hostMo);
 
-  window.addEventListener("resize", onResize);
+  // Panning a node off the canvas should stop it costing anything per tick.
+  const io = new IntersectionObserver((records) => {
+    const was = onScreen;
+    onScreen = records.some((r) => r.isIntersecting);
+    if (onScreen && !was) schedule(); // catch up on whatever changed meanwhile
+  });
+  io.observe(ta);
+  observers.push(io);
+
+  window.addEventListener("resize", onResize, { signal });
 
   let last = ta.value;
-  const poll = setInterval(() => {
+  poll = setInterval(() => {
     if (!alive()) return dispose();
-    // Nothing worth reconciling while the tab is in the background or the node
-    // is collapsed, and verify() costs two forced layout reads per tick. On a
-    // graph with many of these nodes that competes with canvas panning for no
-    // benefit. Both checks below are plain property reads, no layout.
-    if (document.hidden || node.flags?.collapsed) return;
+    // Nothing worth reconciling while the tab is in the background, the node is
+    // collapsed, or it has been panned off screen - and verify() costs two
+    // forced layout reads per tick. On a graph with many of these nodes that
+    // competes with canvas panning for no benefit. All three checks below are
+    // plain property reads, no layout.
+    if (document.hidden || !onScreen || node.flags?.collapsed) return;
     if (ta.value !== last) {
       last = ta.value;
       paint();

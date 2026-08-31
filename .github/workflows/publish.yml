@@ -1,0 +1,35 @@
+name: publish
+
+# Fires when the version in pyproject.toml changes on the default branch, and
+# on demand from the Actions tab. comfy-cli publishes whatever version that file
+# says, so bumping it is the release action - there is nothing else to press.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "pyproject.toml"
+
+jobs:
+  publish:
+    name: publish to the Comfy Registry
+    # Do not ship a version the suite has not passed on.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Run the tests first
+        run: python test_strip_comments.py
+
+      - name: Publish
+        uses: Comfy-Org/publish-node-action@main
+        with:
+          # Settings -> Secrets and variables -> Actions. Never in pyproject.toml.
+          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
